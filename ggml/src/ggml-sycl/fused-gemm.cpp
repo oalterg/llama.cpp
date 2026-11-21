@@ -404,6 +404,7 @@ template <> struct fg_block_traits<block_q3_K>    { static constexpr int qk = QK
 template <> struct fg_block_traits<block_q4_K>    { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q5_K>    { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q6_K>    { static constexpr int qk = QK_K; };
+template <> struct fg_block_traits<block_nvfp4>   { static constexpr int qk = QK_NVFP4; };
 
 // The A stages below are the dequantize_block_iq* kernels rewritten for one k step. There a
 // work-item handled one quarter (il) of one 32-wide sub-block (ib); here one lane produces the
@@ -723,6 +724,39 @@ template <typename E>
 static __dpct_inline__ void fg_stage_a(const block_q6_K * __restrict__ xrow, const int kb, typename E::pair * a) {
     FG_SUPERBLOCK(block_q6_K);
     fg_decode_q6_K<E>(blk->ql, blk->qh, blk->scales, (float) blk->d, ib, a);
+}
+
+// UE4M3 sub-block scale with the e2m1 halving folded in, as ggml_sycl_ue4m3_to_fp32 but without pow():
+// the normal case is the float with exponent exp - 7 - 1 and the 3 mantissa bits on top.
+static __dpct_inline__ float fg_ue4m3_half(const uint8_t x) {
+    const uint32_t exp = (x >> 3) & 0xF;
+    const uint32_t man = x & 0x7;
+    if (x == 0 || x == 0x7F) {
+        return 0.0f;
+    }
+    if (exp == 0) {
+        return (float) man * (1.0f / 1024.0f);
+    }
+    return sycl::bit_cast<float>(((exp + 119u) << 23) | (man << 20));
+}
+
+// nvfp4: a 64-value block is 4 sub-blocks of 16 with one UE4M3 scale each; k step kb is half kb % 2
+// of block kb / 2, i.e. sub-blocks 2*(kb % 2) and 2*(kb % 2) + 1. In a sub-block the low nibbles of
+// its 8 qs bytes are values 0..7 and the high nibbles values 8..15.
+template <typename E>
+static __dpct_inline__ void fg_stage_a(const block_nvfp4 * __restrict__ xrow, const int kb, typename E::pair * a) {
+    const block_nvfp4 * blk = xrow + kb / 2;
+#pragma unroll
+    for (int ls = 0; ls < 2; ++ls) {
+        const int       s  = 2 * (kb % 2) + ls;
+        const float     d  = fg_ue4m3_half(blk->d[s]);
+        const uint8_t * q  = blk->qs + s * (QK_NVFP4_SUB / 2);
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            a[8 * ls + p]     = E::make(d * kvalues_mxfp4[q[2 * p] & 0xf], d * kvalues_mxfp4[q[2 * p + 1] & 0xf]);
+            a[8 * ls + 4 + p] = E::make(d * kvalues_mxfp4[q[2 * p] >> 4],  d * kvalues_mxfp4[q[2 * p + 1] >> 4]);
+        }
+    }
 }
 
 // Reorder (SoA) layout: each block field is one stream over the nblocks of the matrix (of the expert
@@ -1062,7 +1096,7 @@ static void grouped_gemm_pack_b(const float * y, typename S::tsb * packed, const
 template <typename T> static constexpr bool fg_plain_ok() {
     return !std::is_same_v<T, block_q8_0> && !std::is_same_v<T, block_q2_K> && !std::is_same_v<T, block_q3_K> &&
            !std::is_same_v<T, block_q4_K> && !std::is_same_v<T, block_q5_K> &&
-           !std::is_same_v<T, block_q6_K>;
+           !std::is_same_v<T, block_q6_K> && !std::is_same_v<T, block_nvfp4>;
 }
 
 template <typename T, bool R> struct fg_tag {
@@ -1100,6 +1134,7 @@ template <typename F> static bool fg_visit_type(ggml_type type, bool reordered, 
         case GGML_TYPE_Q4_K:    return fg_visit_layout<block_q4_K>(reordered, f);
         case GGML_TYPE_Q5_K:    return fg_visit_layout<block_q5_K>(reordered, f);
         case GGML_TYPE_Q6_K:    return fg_visit_layout<block_q6_K>(reordered, f);
+        case GGML_TYPE_NVFP4:   return fg_visit_layout<block_nvfp4>(reordered, f);
         default:                return false;
     }
 }
