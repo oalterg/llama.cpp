@@ -429,7 +429,11 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
                                                  const int         k_VKQ_0,
                                                  const int         k_VKQ_max,
                                                  const int         col_Q_0,
-                                                 float *           KQ_max_new_shared) {
+                                                 float *           KQ_max_new_shared,
+                                                 const fattn_indexed_bias bias,
+                                                 const int         head,
+                                                 const int         n_heads,
+                                                 const int         sequence) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int cpy_nb   = ggml_sycl_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
@@ -490,10 +494,23 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             }
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
-                KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0] +=
-                    (ncols2 > 1 || mask) ? slope * sycl::vec<sycl::half, 1>(mask[j * stride_mask + k_VKQ_0 + i_KQ])
-                                                       .convert<float, sycl::rounding_mode::automatic>()[0] :
-                                           0.0f;
+                const int k = k_VKQ_0 + i_KQ;
+                float m = (ncols2 > 1 || mask) ?
+                    sycl::vec<sycl::half, 1>(mask[(int64_t) j * stride_mask + k])
+                        .convert<float, sycl::rounding_mode::automatic>()[0] :
+                    0.0f;
+                if constexpr (ncols2 == 1 && (DKQ == 64 || DKQ == 128)) {
+                    if (bias.table) {
+                        // queries of all sequences are flattened in sequence order
+                        const int64_t query = (int64_t) sequence * int(ne01.z()) + j;
+                        const int     bin   = bias.indices[query * bias.stride + k];
+                        if ((uint32_t) bin < bias.n_bins) {
+                            // same F16 rounding as the dense mask the bias replaces
+                            m = (float) sycl::half(m + bias.table[(query * bias.n_bins + bin) * n_heads + head]);
+                        }
+                    }
+                }
+                KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0] += slope * m;
 
                 KQ_max_new[jc0] =
                     sycl::fmax((float) KQ_max_new[jc0],
@@ -694,7 +711,8 @@ static void flash_attn_tile(const char *  Q,
                             const int32_t        ne33,
                             const int32_t        nb31,
                             const int32_t        nb32,
-                            const int64_t        nb33) {
+                            const int64_t        nb33,
+                            const fattn_indexed_bias bias) {
 #ifdef SYCL_FLASH_ATTN
     // Skip unused kernel variants for faster compilation:
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -707,7 +725,7 @@ static void flash_attn_tile(const char *  Q,
                   nb11, nb12, nb13,
                   nb21, nb22, nb23,
                   ne31, ne32, ne33,
-                  nb31, nb32, nb33);
+                  nb31, nb32, nb33, bias);
         return;
     }
 
@@ -869,7 +887,7 @@ static void flash_attn_tile(const char *  Q,
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
                                  oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
-                                            KQ_max_new_shared);
+                                            KQ_max_new_shared, bias, head0, ne02, sequence);
             k_VKQ_0 += item_ct1.get_group_range(1) * nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
@@ -877,7 +895,7 @@ static void flash_attn_tile(const char *  Q,
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
                                  oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
-                                            KQ_max_new_shared);
+                                            KQ_max_new_shared, bias, head0, ne02, sequence);
         }
     } else {
         // Branch without out-of-bounds checks.
@@ -888,7 +906,7 @@ static void flash_attn_tile(const char *  Q,
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
                                  oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
-                                            KQ_max_new_shared);
+                                            KQ_max_new_shared, bias, head0, ne02, sequence);
         }
     }
 
@@ -970,7 +988,8 @@ static void flash_attn_tile(const char *  Q,
     }
 
     // Attention sink: adjust KQ max and sum only for the first of all parallel blocks:
-    if (sinks && item_ct1.get_group(1) == 0) {
+    // With an indexed bias the sink is applied in the final scale or by the combine pass instead.
+    if (sinks && !bias.table && item_ct1.get_group(1) == 0) {
 #pragma unroll
         for (int jc0 = 0; jc0 < cpw; ++jc0) {
             const int   jc   = jc0 + (item_ct1.get_local_id(1) / np) * cpw;
@@ -1011,7 +1030,17 @@ static void flash_attn_tile(const char *  Q,
             return;
         }
 
-        const float scale = item_ct1.get_group_range(1) == 1 ? 1.0f / KQ_sum[jc0] : 1.0f;
+        float scale = 1.0f;
+        if (item_ct1.get_group_range(1) == 1) {
+            if (bias.table && sinks) {
+                const float sink     = ((const float *) sinks)[head0 + c];
+                const float kq_max   = sycl::fmax((float) KQ_max[jc0], sink);
+                const float kq_scale = sycl::native::exp((float) (KQ_max[jc0] - kq_max));
+                scale = kq_scale / (KQ_sum[jc0] * kq_scale + sycl::native::exp(sink - kq_max));
+            } else {
+                scale = 1.0f / KQ_sum[jc0];
+            }
+        }
 
         const int j_dst_unrolled =
             ((sequence * int(ne01.z()) + col_Q_0 + j) * ne02 + head0 + c) * item_ct1.get_group_range(1) +
@@ -1064,7 +1093,7 @@ static void flash_attn_tile(const char *  Q,
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33, bias);
 #endif // SYCL_FLASH_ATTN
 }
 
@@ -1166,7 +1195,9 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
     //const bool nvidia = GGML_SYCL_CC_IS_NVIDIA(ggml_sycl_info().devices[ggml_sycl_get_device()].cc);
     const int gqa_limit = gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
-    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // the indexed bias is per Q head, so it is only applied by the ncols2 == 1 variants
+    const bool use_gqa_opt = !ggml_flash_attn_ext_has_indexed_bias(dst) &&
+        mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     if constexpr (DV == 512) {
         if (use_gqa_opt && gqa_ratio % 16 == 0) {

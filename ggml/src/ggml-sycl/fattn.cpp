@@ -131,10 +131,13 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    // A compact indexed bias (ggml_flash_attn_ext_add_indexed_bias) is only read by the tile kernel.
+    const bool indexed_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
+
     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
     // calling _supported() on every decode FA call.
-    if (Q->ne[1] >= 32 && !ggml_sycl_flash_attn_ext_onednn_failed(device)
+    if (!indexed_bias && Q->ne[1] >= 32 && !ggml_sycl_flash_attn_ext_onednn_failed(device)
         && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
@@ -157,7 +160,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         V->ne[0] == 512 && gqa_ratio == 20 &&
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
 
-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
+    if (!indexed_bias && g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
         (standard_shape || glm_mla_shape) &&
         Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
@@ -246,6 +249,13 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    // The tile kernel applies the indexed bias in its ncols2 == 1 variants for head sizes 64 and 128
+    // (64 has no logit-softcap variant). Other shapes are left to the dense-mask fallback.
+    if (indexed_bias) {
+        return (Q->ne[0] == 128 || (Q->ne[0] == 64 && logit_softcap == 0.0f)) ? BEST_FATTN_KERNEL_TILE
+                                                                               : BEST_FATTN_KERNEL_NONE;
+    }
+
     // q4_0 / q8_0 K/V decode and small batches on Xe2: read the cache directly, no F16 copy of K and V
     if (ggml_sycl_flash_attn_ext_dpas_supported(device, dst)) {
         return BEST_FATTN_KERNEL_DPAS;
@@ -259,7 +269,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     // Fused-XMX path: oneDNN Graph SDPA (flash attention). Strictly
     // additive -- taken only when statically supported, otherwise falls through to VEC/TILE below.
-    if (!ggml_sycl_flash_attn_ext_onednn_failed(device) && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
+    if (!indexed_bias && !ggml_sycl_flash_attn_ext_onednn_failed(device) && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
 

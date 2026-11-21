@@ -20,6 +20,16 @@
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// Compact attention bias (ggml_flash_attn_ext_add_indexed_bias): the kernel adds
+// table[head, indices[key, query], query] to the mask before its F16 rounding.
+// Only the tile kernel reads it; the others take it to share the kernel signature.
+struct fattn_indexed_bias {
+    const float   * table;
+    const int32_t * indices;
+    int64_t         n_bins;
+    int64_t         stride; // int32 elements between the index rows of consecutive queries
+};
+
 typedef void (*fattn_kernel_t)(
     const char* Q,
     const char* K,
@@ -57,7 +67,8 @@ typedef void (*fattn_kernel_t)(
     const int32_t ne33,
     const int32_t nb31,
     const int32_t nb32,
-    const int64_t nb33);
+    const int64_t nb33,
+    const fattn_indexed_bias bias);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -784,6 +795,7 @@ static void flash_attn_combine_results(const float * __restrict__ VKQ_parts,
                                        const sycl::float2 * __restrict__ VKQ_meta,
                                        float * __restrict__ dst,
                                        const int parallel_blocks,
+                                       const float * __restrict__ sinks,
                                        uint8_t * dpct_local) {
     // Dimension 0: threadIdx.x
     // Dimension 1: blockIdx.x
@@ -815,13 +827,14 @@ static void flash_attn_combine_results(const float * __restrict__ VKQ_parts,
 
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
-    float kqmax = meta[0].x();
+    // sinks is set only with an indexed bias, where the kernel leaves the sink to this pass
+    float kqmax = sinks ? sycl::fmax(meta[0].x(), sinks[head]) : meta[0].x();
     for (int l = 1; l < parallel_blocks; ++l) {
         kqmax = sycl::max(kqmax, meta[l].x());
     }
 
     float VKQ_numerator   = 0.0f;
-    float VKQ_denominator = 0.0f;
+    float VKQ_denominator = sinks ? sycl::native::exp(sinks[head] - kqmax) : 0.0f;
     for (int l = 0; l < parallel_blocks; ++l) {
         const float KQ_max_scale = sycl::native::exp(meta[l].x() - kqmax);
 
@@ -897,7 +910,8 @@ static void lauch_kernel(
     const int32_t ne33,
     const int32_t nb31,
     const int32_t nb32,
-    const int64_t nb33) {
+    const int64_t nb33,
+    const fattn_indexed_bias bias) {
     GGML_UNUSED(local_mem_size);
 
     const auto rng = sycl::nd_range<3>(
@@ -910,7 +924,7 @@ static void lauch_kernel(
                      max_bias, m0, m1, n_head_log2, logit_softcap, ne00,
                      ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11,
                      ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23,
-                     ne31, ne32, ne33, nb31, nb32, nb33);
+                     ne31, ne32, ne33, nb31, nb32, nb33, bias);
     };
 
     q->submit([&](sycl::handler &cgh) {
@@ -935,6 +949,11 @@ void launch_fattn(
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+
+    const bool has_indexed_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
+    const ggml_tensor * bias_table   = has_indexed_bias ? dst->src[6] : nullptr;
+    const ggml_tensor * bias_indices = has_indexed_bias ? dst->src[7] : nullptr;
+    GGML_ASSERT(!has_indexed_bias || (bias_table && bias_indices && mask && mask->ne[2] == 1));
 
     ggml_tensor * KQV = dst;
 
@@ -1039,7 +1058,9 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    // An indexed bias requires an unpadded mask (mask->ne[1] == Q->ne[1]), and the scan reads whole ncols1 tiles.
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1) &&
+            (!has_indexed_bias || Q->ne[1] % ncols1 == 0)) {
         const int s31 = mask->nb[1] / sizeof(sycl::half2);
         const int s33 = mask->nb[3] / sizeof(sycl::half2);
 
@@ -1153,14 +1174,23 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
+    const fattn_indexed_bias bias = has_indexed_bias ?
+        fattn_indexed_bias{ (const float *) bias_table->data, (const int32_t *) bias_indices->data,
+                            bias_table->ne[1], (int64_t) (bias_indices->nb[1] / sizeof(int32_t)) } :
+        fattn_indexed_bias{ nullptr, nullptr, 0, 0 };
+
+    // With an indexed bias and several parallel blocks, the sink is folded in by the combine pass.
+    const float * combine_sinks = has_indexed_bias && sinks && !stream_k && parallel_blocks > 1 ?
+        (const float *) sinks->data : nullptr;
+
     lauch_kernel<fattn_kernel, warp_size, use_large_grf>(
         blocks_num, block_dim, main_stream, (unsigned int) nbytes_shared, (const char *) Q->data, K_data, V_data,
-        mask ? ((const char *) mask->data) : nullptr, sinks ? ((const char *) sinks->data) : nullptr, KV_max.ptr,
+        mask ? ((const char *) mask->data) : nullptr, sinks && !combine_sinks ? ((const char *) sinks->data) : nullptr, KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, (sycl::float2 *)dst_tmp_meta.ptr, scale, max_bias, m0, m1,
         n_head_log2, logit_softcap, Q->ne[0], ne01, Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->ne[0],
         K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13, nb21, nb22, nb23, mask ? mask->ne[1] : 0,
         mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0,
-        mask ? mask->nb[3] : 0);
+        mask ? mask->nb[3] : 0, bias);
     SYCL_CHECK(0);
 
     if (stream_k) {
@@ -1201,7 +1231,7 @@ void launch_fattn(
                              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(warp_size)]] {
                                  GGML_UNUSED(item_ct1);
                                  flash_attn_combine_results<DV>(
-                                     dst_tmp_ptr_ct0, dst_tmp_meta_ptr_ct1, KQV_data_ct2, parallel_blocks,
+                                     dst_tmp_ptr_ct0, dst_tmp_meta_ptr_ct1, KQV_data_ct2, parallel_blocks, combine_sinks,
                                      dpct_local_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
                              });
         });

@@ -641,7 +641,7 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
             cgh.parallel_for(
                 sycl::nd_range<3>(sycl::range<3>(Q->ne[3], Q->ne[2], (size_t) ne01 * D), sycl::range<3>(1, 1, D)),
                 [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
-                    flash_attn_combine_results<D>(parts_p, meta_p, dst_p, nsplit,
+                    flash_attn_combine_results<D>(parts_p, meta_p, dst_p, nsplit, nullptr,
                                                   lm.get_multi_ptr<sycl::access::decorated::no>().get());
                 });
         });

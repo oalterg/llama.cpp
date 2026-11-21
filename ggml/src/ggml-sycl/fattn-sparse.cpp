@@ -124,6 +124,11 @@ static bool sparse_fa_applicable(const ggml_tensor * dst, int64_t & n_kv_g_out) 
         return false;
     }
 
+    // the indexed bias addresses keys by their position in the full cache, which the gather would shift
+    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
+        return false;
+    }
+
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
     if (n_kv_max <= 0) {
         return false;
