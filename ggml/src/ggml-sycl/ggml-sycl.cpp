@@ -6957,6 +6957,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 
         if (node->op == GGML_OP_SSM_CONV &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE }, {})) {
+            ggml_tensor * add = cgraph->nodes[i + 2];
+            ggml_sycl_ssm_conv_res_scale(*sycl_ctx, node, add->src[0] == cgraph->nodes[i + 1] ? add->src[1] : add->src[0],
+                                         cgraph->nodes[i + 3]);
+            i += 3;
+            continue;
+        }
+
+        if (node->op == GGML_OP_SSM_CONV &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
             ggml_sycl_ssm_conv_fused(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
             i += 2;

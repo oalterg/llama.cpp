@@ -196,6 +196,34 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
                x->ne[1] <= GGML_SYCL_DEPTH_MIX_MAX_STATES && q->ne[1] <= GGML_SYCL_DEPTH_MIX_MAX_QUERIES;
     }
 
+    // a short conv on a residual stream, Inkling's convolve(): SSM_CONV, RESHAPE to [channels, tokens],
+    // ADD of the residual, SCALE; the SCALE is the only output
+    if (ops.size() == 4 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_RESHAPE) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 })) {
+            return false;
+        }
+
+        ggml_tensor * const * n   = cgraph->nodes + node_idx;
+        const ggml_tensor *   add = n[2];
+        const ggml_tensor *   out = n[3];
+        if (n[1]->src[0] != n[0] || (add->src[0] != n[1] && add->src[1] != n[1]) || out->src[0] != add) {
+            return false;
+        }
+        const ggml_tensor * res = add->src[0] == n[1] ? add->src[1] : add->src[0];
+        const ggml_tensor * x   = n[0]->src[0];
+        const ggml_tensor * w   = n[0]->src[1];
+        // the kernel stores into out while other work-groups still read x and w
+        auto overlaps = [out](const ggml_tensor * t) {
+            const char * a = (const char *) out->data;
+            const char * b = (const char *) t->data;
+            return a < b + ggml_nbytes(t) && b < a + ggml_nbytes(out);
+        };
+
+        return n[0]->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32 && out->type == GGML_TYPE_F32 &&
+               ggml_is_contiguous(n[0]) && ggml_is_contiguous(res) && ggml_is_contiguous(out) &&
+               ggml_are_same_shape(res, out) && ggml_are_same_shape(n[1], out) && !overlaps(x) && !overlaps(w);
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }

@@ -6,8 +6,18 @@
 
 using namespace sycl;
 
+// What the conv output goes through before its store: + a 1-D channel bias, SiLU, then
+// (residual + .) * scale + shift, the residual laid out like dst. Unfused launches pass {}.
+struct ssm_conv_epilogue {
+    bool          silu  = false;
+    const float * bias  = nullptr;
+    const float * res   = nullptr;
+    float         scale = 1.0f;
+    float         shift = 0.0f;
+};
+
 // One output element of the conv. DC is d_conv as a compile-time constant (0 keeps the
-// runtime loop); unfused callers pass literal false/nullptr so the epilogue folds away.
+// runtime loop); unfused callers pass an empty epilogue so it folds away.
 template <int DC>
 static __dpct_inline__ void ssm_conv_element(
     size_t idx,
@@ -21,8 +31,7 @@ static __dpct_inline__ void ssm_conv_element(
     int src_stride_seq,
     int dst_stride_token,
     int dst_stride_seq,
-    bool apply_silu,
-    const float *bias
+    const ssm_conv_epilogue ep
 ) {
     // src is token-contiguous per channel, dst is channel-contiguous per token,
     // so indexing token-fastest coalesces the d_conv loads.
@@ -50,8 +59,11 @@ static __dpct_inline__ void ssm_conv_element(
     }
 
     // fused bias add: the ADD node broadcasts a 1-D channel bias over tokens
-    if (bias != nullptr) {
-        sumf += bias[channel];
+    if (ep.bias != nullptr) {
+        sumf += ep.bias[channel];
+    }
+    if (ep.silu) {
+        sumf = op_silu(sumf);
     }
 
     const size_t dst_idx =
@@ -59,10 +71,13 @@ static __dpct_inline__ void ssm_conv_element(
         static_cast<size_t>(token) * static_cast<size_t>(dst_stride_token) +
         static_cast<size_t>(channel);
 
-    dst_data[dst_idx] = apply_silu ? op_silu(sumf) : sumf;
+    if (ep.res != nullptr) {
+        sumf = (ep.res[dst_idx] + sumf) * ep.scale + ep.shift;
+    }
+    dst_data[dst_idx] = sumf;
 }
 
-// FUSED=false keeps apply_silu/bias out of the kernel capture list, so the unfused launch
+// FUSED=false keeps the epilogue out of the kernel capture list, so the unfused launch
 // takes the pre-fusion argument list; matters at n_t == 1, where the op is launch-bound.
 template <int DC, bool FUSED>
 static void kernel_ssm_conv_impl(
@@ -79,8 +94,7 @@ static void kernel_ssm_conv_impl(
     int src_stride_seq,
     int dst_stride_token,
     int dst_stride_seq,
-    bool apply_silu,
-    const float *bias
+    const ssm_conv_epilogue ep
 ) {
     const size_t total_work = static_cast<size_t>(d_inner) * static_cast<size_t>(n_t) * static_cast<size_t>(n_s);
     const size_t work_group_size = 256;
@@ -101,13 +115,12 @@ static void kernel_ssm_conv_impl(
 
                     ssm_conv_element<DC>(idx, src_data, weights, dst_data, d_conv, d_inner, n_t,
                                          src_stride_inner, src_stride_seq, dst_stride_token,
-                                         dst_stride_seq, apply_silu, bias);
+                                         dst_stride_seq, ep);
                 }
             );
         });
     } else {
-        GGML_UNUSED(apply_silu);
-        GGML_UNUSED(bias);
+        GGML_UNUSED(ep);
 
         q.submit([&](handler &h) {
             h.parallel_for(
@@ -120,7 +133,7 @@ static void kernel_ssm_conv_impl(
 
                     ssm_conv_element<DC>(idx, src_data, weights, dst_data, d_conv, d_inner, n_t,
                                          src_stride_inner, src_stride_seq, dst_stride_token,
-                                         dst_stride_seq, false, nullptr);
+                                         dst_stride_seq, ssm_conv_epilogue{});
                 }
             );
         });
@@ -133,8 +146,7 @@ template <int DC, int TT, int TC, int WG>
 static __dpct_inline__ void ssm_conv_tile(
     nd_item<1> it, local_accessor<float, 1> tile, const float *src_data, const float *weights,
     float *dst_data, int n_t, int nt_tiles, int nc_tiles, int src_stride_inner,
-    int src_stride_seq, int dst_stride_token, int dst_stride_seq, bool apply_silu,
-    const float *bias
+    int src_stride_seq, int dst_stride_token, int dst_stride_seq, const ssm_conv_epilogue ep
 ) {
     const int    lid = static_cast<int>(it.get_local_id(0));
     const size_t g   = it.get_group(0);
@@ -156,8 +168,8 @@ static __dpct_inline__ void ssm_conv_tile(
             const float *cw = weights + static_cast<size_t>(c0 + c) * DC;
 #pragma unroll
             for (int i = 0; i < DC; ++i) sumf += s[i] * cw[i];
-            if (bias != nullptr) sumf += bias[c0 + c];
-            if (apply_silu) sumf = op_silu(sumf);
+            if (ep.bias != nullptr) sumf += ep.bias[c0 + c];
+            if (ep.silu) sumf = op_silu(sumf);
         }
         tile[c * (TT + 1) + ti] = sumf;
     }
@@ -170,20 +182,22 @@ static __dpct_inline__ void ssm_conv_tile(
         const int t   = tj + r * (WG / TC);
         const int tok = t0 + t;
         if (tok < n_t) {
-            dst_data[static_cast<size_t>(seq) * dst_stride_seq
-                     + static_cast<size_t>(tok) * dst_stride_token + c0 + cc]
-                = tile[cc * (TT + 1) + t];
+            const size_t di = static_cast<size_t>(seq) * dst_stride_seq
+                            + static_cast<size_t>(tok) * dst_stride_token + c0 + cc;
+            float v = tile[cc * (TT + 1) + t];
+            if (ep.res != nullptr) v = (ep.res[di] + v) * ep.scale + ep.shift;
+            dst_data[di] = v;
         }
     }
 }
 
 // Same FUSED split as kernel_ssm_conv_impl. The fused instantiation keeps the runtime
-// apply_silu/bias branches: at n_t >= 32 they are amortized over the whole tile.
+// epilogue branches: at n_t >= 32 they are amortized over the whole tile.
 template <int DC, bool FUSED>
 static void kernel_ssm_conv_tiled(
     queue &q, const float *src_data, const float *weights, float *dst_data,
     int d_inner, int n_t, int n_s, int src_stride_inner, int src_stride_seq,
-    int dst_stride_token, int dst_stride_seq, bool apply_silu, const float *bias
+    int dst_stride_token, int dst_stride_seq, const ssm_conv_epilogue ep
 ) {
     constexpr int TT = 32, TC = 32, WG = 256;
     const int nt_tiles = (n_t + TT - 1) / TT;
@@ -196,19 +210,18 @@ static void kernel_ssm_conv_tiled(
             h.parallel_for(nd_range<1>(range<1>(groups * WG), range<1>(WG)), [=](nd_item<1> it) {
                 ssm_conv_tile<DC, TT, TC, WG>(it, tile, src_data, weights, dst_data, n_t, nt_tiles,
                                               nc_tiles, src_stride_inner, src_stride_seq,
-                                              dst_stride_token, dst_stride_seq, apply_silu, bias);
+                                              dst_stride_token, dst_stride_seq, ep);
             });
         });
     } else {
-        GGML_UNUSED(apply_silu);
-        GGML_UNUSED(bias);
+        GGML_UNUSED(ep);
 
         q.submit([&](handler &h) {
             local_accessor<float, 1> tile(range<1>(TC * (TT + 1)), h);
             h.parallel_for(nd_range<1>(range<1>(groups * WG), range<1>(WG)), [=](nd_item<1> it) {
                 ssm_conv_tile<DC, TT, TC, WG>(it, tile, src_data, weights, dst_data, n_t, nt_tiles,
                                               nc_tiles, src_stride_inner, src_stride_seq,
-                                              dst_stride_token, dst_stride_seq, false, nullptr);
+                                              dst_stride_token, dst_stride_seq, ssm_conv_epilogue{});
             });
         });
     }
@@ -228,12 +241,11 @@ static void kernel_ssm_conv(
     int src_stride_seq,
     int dst_stride_token,
     int dst_stride_seq,
-    bool apply_silu,
-    const float *bias
+    const ssm_conv_epilogue ep
 ) {
-    // Only the fused instantiations carry apply_silu/bias as kernel arguments; the plain
+    // Only the fused instantiations carry the epilogue as kernel arguments; the plain
     // ssm_conv launch keeps the argument list it had before the fusion landed.
-    const bool fused = apply_silu || bias != nullptr;
+    const bool fused = ep.silu || ep.bias != nullptr || ep.res != nullptr;
 
     // d_inner must be a multiple of 32 so the channel tiles are exact; the transpose is only
     // worth it for n_t >= 32. d_conv == 4 is the only window with a DC-specialized kernel.
@@ -241,11 +253,11 @@ static void kernel_ssm_conv(
         if (fused) {
             kernel_ssm_conv_tiled<4, true>(q, src_data, weights, dst_data, d_inner, n_t, n_s,
                                            src_stride_inner, src_stride_seq, dst_stride_token,
-                                           dst_stride_seq, apply_silu, bias);
+                                           dst_stride_seq, ep);
         } else {
             kernel_ssm_conv_tiled<4, false>(q, src_data, weights, dst_data, d_inner, n_t, n_s,
                                             src_stride_inner, src_stride_seq, dst_stride_token,
-                                            dst_stride_seq, apply_silu, bias);
+                                            dst_stride_seq, ep);
         }
         return;
     }
@@ -254,11 +266,11 @@ static void kernel_ssm_conv(
         if (fused) {
             kernel_ssm_conv_impl<4, true>(q, src_data, weights, dst_data, d_conv, d_inner, n_t, n_s,
                                           ncs, src_stride_inner, src_stride_seq, dst_stride_token,
-                                          dst_stride_seq, apply_silu, bias);
+                                          dst_stride_seq, ep);
         } else {
             kernel_ssm_conv_impl<4, false>(q, src_data, weights, dst_data, d_conv, d_inner, n_t, n_s,
                                            ncs, src_stride_inner, src_stride_seq, dst_stride_token,
-                                           dst_stride_seq, apply_silu, bias);
+                                           dst_stride_seq, ep);
         }
         return;
     }
@@ -266,22 +278,23 @@ static void kernel_ssm_conv(
     if (fused) {
         kernel_ssm_conv_impl<0, true>(q, src_data, weights, dst_data, d_conv, d_inner, n_t, n_s,
                                       ncs, src_stride_inner, src_stride_seq, dst_stride_token,
-                                      dst_stride_seq, apply_silu, bias);
+                                      dst_stride_seq, ep);
     } else {
         kernel_ssm_conv_impl<0, false>(q, src_data, weights, dst_data, d_conv, d_inner, n_t, n_s,
                                        ncs, src_stride_inner, src_stride_seq, dst_stride_token,
-                                       dst_stride_seq, apply_silu, bias);
+                                       dst_stride_seq, ep);
     }
 }
 
-inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst = nullptr, const float * bias = nullptr) {
+// out: where the result goes, dst->data unless a fused epilogue stores into a later node
+inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst, float * out = nullptr,
+                                  const ssm_conv_epilogue ep = {}) {
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
-    GGML_ASSERT(bias == nullptr || silu_dst != nullptr);
 
     const int d_conv   = src1->ne[0];
     const int ncs      = src0->ne[0];
@@ -312,8 +325,7 @@ inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor *
 
         const float *src_data = static_cast<const float *>(src0->data);
         const float *weights  = static_cast<const float *>(src1->data);
-        const bool apply_silu = silu_dst != nullptr;
-        float *dst_data       = static_cast<float *>((silu_dst ? silu_dst : dst)->data);
+        float *dst_data       = out ? out : static_cast<float *>(dst->data);
 
         GGML_ASSERT(src_data && weights && dst_data);
 
@@ -331,8 +343,7 @@ inline void ggml_sycl_op_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor *
             src_stride_seq,
             dst_stride_token,
             dst_stride_seq,
-            apply_silu,
-            bias
+            ep
         );
 
     } catch (const std::exception &e) {
@@ -357,5 +368,21 @@ void ggml_sycl_ssm_conv_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         const ggml_tensor * bias_t = (add->src[0] == dst) ? add->src[1] : add->src[0];
         bias = static_cast<const float *>(bias_t->data);
     }
-    ggml_sycl_op_ssm_conv(ctx, dst, silu_dst, bias);
+    ssm_conv_epilogue ep;
+    ep.silu = true;
+    ep.bias = bias;
+    ggml_sycl_op_ssm_conv(ctx, dst, static_cast<float *>(silu_dst->data), ep);
+}
+
+// Fused ssm_conv + RESHAPE + ADD + SCALE, a short conv on a residual stream (Inkling 2's
+// convolve()): write (res + conv(x)) * scale + shift into the SCALE node, res laid out like the
+// conv output. The conv output and the ADD result are never written.
+void ggml_sycl_ssm_conv_res_scale(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * res,
+                                  ggml_tensor * scale) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+    ssm_conv_epilogue ep;
+    ep.res   = static_cast<const float *>(res->data);
+    ep.scale = ggml_get_op_params_f32(scale, 0);
+    ep.shift = ggml_get_op_params_f32(scale, 1);
+    ggml_sycl_op_ssm_conv(ctx, dst, static_cast<float *>(scale->data), ep);
 }

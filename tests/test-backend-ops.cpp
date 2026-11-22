@@ -5093,6 +5093,45 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// fused ssm_conv + reshape + residual add + scale (Inkling 2's convolve())
+struct test_ssm_conv_res_scale : public test_case {
+    const std::array<int64_t, 4> ne_a;
+    const int64_t d_conv;
+    const bool res_first;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_RES_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne_a, d_conv, res_first);
+    }
+
+    test_ssm_conv_res_scale(std::array<int64_t, 4> ne_a, int64_t d_conv, bool res_first)
+        : ne_a(ne_a), d_conv(d_conv), res_first(res_first) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, ne_a[1]);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
+        out = ggml_reshape_2d(ctx, out, out->ne[0], out->ne[1] * out->ne[2]);
+
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, out->ne[0], out->ne[1]);
+        ggml_set_name(res, "res");
+        out = res_first ? ggml_add(ctx, res, out) : ggml_add(ctx, out, res);
+        out = ggml_scale(ctx, out, 1.0f / sqrtf(d_conv + 1));
+
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -12070,6 +12109,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // long token (n_t > 32, exercises the long_token kernel path)
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
+        }
+    }
+
+    for (int64_t d_inner : {256, 1024, 2304}) {
+        for (bool res_first : {true, false}) {
+            for (int64_t n_t : {1, 7, 64}) {
+                for (int64_t n_s : {1, 3}) {
+                    test_cases.emplace_back(new test_ssm_conv_res_scale({3 + n_t, d_inner, n_s, 1}, 4, res_first));
+                }
+            }
+            test_cases.emplace_back(new test_ssm_conv_res_scale({2 + 5, d_inner, 2, 1}, 3, res_first));
         }
     }
 
