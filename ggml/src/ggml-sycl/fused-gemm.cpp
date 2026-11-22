@@ -1,6 +1,7 @@
 #include "fused-gemm.hpp"
 #include "fused-gemm-esimd.hpp"
 #include "quants.hpp"
+#include "vecdotq.hpp"
 
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 
@@ -726,20 +727,6 @@ static __dpct_inline__ void fg_stage_a(const block_q6_K * __restrict__ xrow, con
     fg_decode_q6_K<E>(blk->ql, blk->qh, blk->scales, (float) blk->d, ib, a);
 }
 
-// UE4M3 sub-block scale with the e2m1 halving folded in, as ggml_sycl_ue4m3_to_fp32 but without pow():
-// the normal case is the float with exponent exp - 7 - 1 and the 3 mantissa bits on top.
-static __dpct_inline__ float fg_ue4m3_half(const uint8_t x) {
-    const uint32_t exp = (x >> 3) & 0xF;
-    const uint32_t man = x & 0x7;
-    if (x == 0 || x == 0x7F) {
-        return 0.0f;
-    }
-    if (exp == 0) {
-        return (float) man * (1.0f / 1024.0f);
-    }
-    return sycl::bit_cast<float>(((exp + 119u) << 23) | (man << 20));
-}
-
 // nvfp4: a 64-value block is 4 sub-blocks of 16 with one UE4M3 scale each; k step kb is half kb % 2
 // of block kb / 2, i.e. sub-blocks 2*(kb % 2) and 2*(kb % 2) + 1. In a sub-block the low nibbles of
 // its 8 qs bytes are values 0..7 and the high nibbles values 8..15.
@@ -749,12 +736,18 @@ static __dpct_inline__ void fg_stage_a(const block_nvfp4 * __restrict__ xrow, co
 #pragma unroll
     for (int ls = 0; ls < 2; ++ls) {
         const int       s  = 2 * (kb % 2) + ls;
-        const float     d  = fg_ue4m3_half(blk->d[s]);
-        const uint8_t * q  = blk->qs + s * (QK_NVFP4_SUB / 2);
+        const float     d  = ggml_sycl_ue4m3_to_fp32(blk->d[s]);
+        // two words of 4 qs bytes; SWAR decode of 4 codes at a time instead of a table load per value
 #pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            a[8 * ls + p]     = E::make(d * kvalues_mxfp4[q[2 * p] & 0xf], d * kvalues_mxfp4[q[2 * p + 1] & 0xf]);
-            a[8 * ls + 4 + p] = E::make(d * kvalues_mxfp4[q[2 * p] >> 4],  d * kvalues_mxfp4[q[2 * p + 1] >> 4]);
+        for (int w = 0; w < 2; ++w) {
+            const uint32_t q  = get_int_b4(blk->qs, s * 2 + w);
+            const uint32_t lo = mxfp4_codes_to_int8(q & 0x0f0f0f0fu);
+            const uint32_t hi = mxfp4_codes_to_int8((q >> 4) & 0x0f0f0f0fu);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                a[8 * ls + 2 * w + h]     = E::make(d * (int8_t) (lo >> 16 * h), d * (int8_t) (lo >> (16 * h + 8)));
+                a[8 * ls + 4 + 2 * w + h] = E::make(d * (int8_t) (hi >> 16 * h), d * (int8_t) (hi >> (16 * h + 8)));
+            }
         }
     }
 }

@@ -1194,15 +1194,14 @@ static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32(uint8_t x) {
     if (x == 0 || x == 0x7F) {
         return 0.0f;
     }
-    const int exp = (x >> 3) & 0xF;
-    const int man = x & 0x7;
-    float raw;
+    // the * 0.5f halves the doubled e2m1 values of kvalues_mxfp4. Built from bits: pow() here was most
+    // of the NVFP4 GEMV's cost. A normal scale is the float with exponent exp - 7 - 1, mantissa on top.
+    const uint32_t exp = (x >> 3) & 0xF;
+    const uint32_t man = x & 0x7;
     if (exp == 0) {
-        raw = man * (1.0f / 8.0f) * sycl::pow(2.0f, -6.0f);
-    } else {
-        raw = (1.0f + man / 8.0f) * sycl::pow(2.0f, (float) exp - 7.0f);
+        return (float) man * (1.0f / 1024.0f);
     }
-    return raw * 0.5f;
+    return sycl::bit_cast<float>(((exp + 119u) << 23) | (man << 20));
 }
 
 #endif // GGML_SYCL_COMMON_HPP
