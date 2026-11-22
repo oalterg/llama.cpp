@@ -1201,6 +1201,74 @@ static void ggml_sycl_op_swiglu_oai(ggml_backend_sycl_context & ctx, ggml_tensor
 }
 
 template <typename T>
+static void situ_kernel(const T * x, const T * g, T * dst, const int64_t k,
+                        const int64_t n, const int64_t o0, const int64_t o1,
+                        float beta, float lb, sycl::nd_item<3> item_ct1) {
+    const int64_t i = int64_t(item_ct1.get_local_range(2)) * item_ct1.get_group(2) + item_ct1.get_local_id(2);
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t j0 = (i / n) * o0 + (i % n);
+    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+
+    const float xi = x[j0];
+    const float gi = g[j1];
+
+    const float act = beta * sycl::tanh(xi / beta) * (1.0f / (1.0f + sycl::exp(-xi)));
+    dst[i] = act * (lb > 0.0f ? lb * sycl::tanh(gi / lb) : gi);
+}
+
+template <typename T>
+static void situ_sycl(const T * x, const T * g, T * dst, const int64_t k, const int64_t n,
+                      const int64_t o0, const int64_t o1, const float beta, const float lb,
+                      dpct::queue_ptr stream) {
+    const int64_t num_blocks = (k + SYCL_GLU_BLOCK_SIZE - 1) / SYCL_GLU_BLOCK_SIZE;
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_GLU_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_GLU_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             situ_kernel(x, g, dst, k, n, o0, o1, beta, lb, item_ct1);
+                         });
+}
+
+static void ggml_sycl_op_situ(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int64_t o0 = src0->nb[1] / ggml_element_size(src0);
+    const int64_t o1 = (src1 ? src1->nb[1] : src0->nb[1]) / ggml_element_size(src0);
+    dpct::queue_ptr stream = ctx.stream();
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(src0->type == dst->type);
+    GGML_ASSERT(dst->ne[0] == nc);
+    if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(src0->type == src1->type);
+    }
+
+    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+    const float   beta    = ggml_get_op_params_f32(dst, 2);
+    const float   lb      = ggml_get_op_params_f32(dst, 3);
+
+    auto launch = [&](auto * src0_p, auto * dst_p) {
+        auto * src1_p = src1 ? (decltype(src0_p)) src1->data : src0_p;
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+        situ_sycl(src0_p, src1_p, dst_p, ggml_nelements(dst), nc, o0, o1, beta, lb, stream);
+    };
+    if (src0->type == GGML_TYPE_F16) {
+        launch((sycl::half *) src0->data, (sycl::half *) dst->data);
+    } else {
+        launch((float *) src0->data, (float *) dst->data);
+    }
+}
+
+template <typename T>
 static void swiglu_clamp_kernel(const T *        gate,
                                 const T *        up,
                                 T *              dst,
@@ -1457,6 +1525,11 @@ void ggml_sycl_swiglu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 void ggml_sycl_swiglu_oai(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
     ggml_sycl_op_swiglu_oai(ctx, dst);
+}
+
+void ggml_sycl_situ(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
+    ggml_sycl_op_situ(ctx, dst);
 }
 
 void ggml_sycl_swiglu_clamp(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

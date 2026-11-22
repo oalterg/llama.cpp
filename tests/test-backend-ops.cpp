@@ -2366,6 +2366,48 @@ struct test_glu_split : public test_case {
     }
 };
 
+struct test_situ : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_a;
+    int v; // view (1 : non-contiguous a)
+    float beta;
+    float lb;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne_a, v, beta, lb);
+    }
+
+    test_situ(ggml_type type, std::array<int64_t, 4> ne_a, int v, float beta, float lb)
+        : type(type), ne_a(ne_a), v(v), beta(beta), lb(lb) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto ne = ne_a; if (v & 1) { ne[0] *= 3; }
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+        if (v & 1) {
+            a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
+            b = ggml_view_4d(ctx, b, ne_a[0], ne_a[1], ne_a[2], ne_a[3], b->nb[1], b->nb[2], b->nb[3], 0);
+        }
+        ggml_tensor * out = ggml_situ_split(ctx, a, b, beta, lb);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -30.f, 30.f);
+        }
+    }
+
+    double max_nmse_err() override {
+        return type == GGML_TYPE_F16 ? 5e-6 : 1e-7;
+    }
+};
+
 struct test_swiglu_oai : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -10907,7 +10949,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
-                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP) {
+                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP || op == GGML_GLU_OP_SITU) {
                     continue;
                 }
 
@@ -10928,6 +10970,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (float limit : {2.0f, 7.0f}) {
                     test_cases.emplace_back(new test_swiglu_oai(type, { 128, 2, 2, 2 }, v, alpha, limit));
                 }
+            }
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
+        for (int v : {0, 1}) {
+            for (float lb : {0.0f, 2.5f}) {
+                test_cases.emplace_back(new test_situ(type, { 128, 2, 2, 2 }, v, 3.0f, lb));
+                test_cases.emplace_back(new test_situ(type, { 5, 7, 11, 13 }, v, 3.0f, lb));
             }
         }
     }
