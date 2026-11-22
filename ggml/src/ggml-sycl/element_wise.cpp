@@ -1019,6 +1019,7 @@ static void dispatch_fused_unary_op(ggml_unary_op uop, F && launch) {
         case GGML_UNARY_OP_SILU:     launch([](float v) { return op_silu(v); });     break;
         case GGML_UNARY_OP_SIGMOID:  launch([](float v) { return op_sigmoid(v); });  break;
         case GGML_UNARY_OP_SOFTPLUS: launch([](float v) { return op_softplus(v); }); break;
+        case GGML_UNARY_OP_TANH:     launch([](float v) { return op_tanh(v); });     break;
         default:
             GGML_ABORT("fused unary chain: unsupported unary op %s", ggml_unary_op_name(uop));
     }
