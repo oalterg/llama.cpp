@@ -13885,6 +13885,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_topk_moe({384,  1, 1, 1}, 6, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
     }
 
+    // Inkling 2's router: 128 experts top-8, sigmoid, selection bias, sum + eps
+    for (int64_t n_tokens : {1, 5, 512}) {
+        for (float scale_w : {0.0f, 2.5f}) {
+            test_cases.emplace_back(new test_topk_moe({128, n_tokens, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
+        }
+    }
+
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));
