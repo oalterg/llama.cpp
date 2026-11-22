@@ -143,6 +143,30 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         return ggml_sycl_can_fuse(cgraph, node_idx + 1, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {});
     }
 
+    // clip of a row to an L2 norm: x * clamp(fill(n, c) / n, lo, hi) with n = scale(sqrt(sum_rows(sqr(x))));
+    // n feeds both FILL and DIV, so this is a subgraph with the MUL as its only output
+    if (ops.size() == 8 && ops.begin()[0] == GGML_OP_SQR && ops.begin()[7] == GGML_OP_MUL) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 7 })) {
+            return false;
+        }
+
+        ggml_tensor * const * n = cgraph->nodes + node_idx;
+        const ggml_tensor *   x = n[0]->src[0];
+        if (n[1]->src[0] != n[0] || n[2]->src[0] != n[1] || n[3]->src[0] != n[2] || n[4]->src[0] != n[3] ||
+            n[5]->src[0] != n[4] || n[5]->src[1] != n[3] || n[6]->src[0] != n[5] ||
+            n[7]->src[0] != x || n[7]->src[1] != n[6]) {
+            return false;
+        }
+        for (int k = 0; k < 8; ++k) {
+            if (n[k]->type != GGML_TYPE_F32) {
+                return false;
+            }
+        }
+
+        return x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_is_contiguous(n[7]) &&
+               ggml_are_same_shape(x, n[7]);
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }

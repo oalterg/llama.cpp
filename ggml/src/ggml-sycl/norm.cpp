@@ -777,6 +777,44 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 // Fused rms_norm + scale (the qwen35 GDN l2-norm pair build_gdn_l2_norm emits):
 // the scale factor is a host scalar in the GGML_OP_SCALE node's op_params, so
 // unlike the mul variants there is no second device tensor to wire up.
+// each row times clamp(c / (sqrt(sum(x^2))*scale + bias), lo, hi): Inkling's clip(), one pass instead of eight ops
+void ggml_sycl_op_row_norm_clip_fused(ggml_backend_sycl_context & ctx, ggml_tensor ** nodes) {
+    const ggml_tensor * x   = nodes[0]->src[0];
+    ggml_tensor *       dst = nodes[7];
+
+    const float scale = ggml_get_op_params_f32(nodes[3], 0);
+    const float bias  = ggml_get_op_params_f32(nodes[3], 1);
+    const float c     = ggml_get_op_params_f32(nodes[4], 0);
+    const float lo    = ggml_get_op_params_f32(nodes[6], 0);
+    const float hi    = ggml_get_op_params_f32(nodes[6], 1);
+
+    const int     ncols = x->ne[0];
+    const int64_t nrows = ggml_nrows(x);
+    const float * xd    = static_cast<const float *>(x->data);
+    float *       dd    = static_cast<float *>(dst->data);
+
+    dpct::queue_ptr stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, nrows * WARP_SIZE), sycl::range<3>(1, 1, WARP_SIZE)),
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const int64_t row  = item_ct1.get_group(2);
+            const int     lane = item_ct1.get_local_id(2);
+            const float * xr   = xd + row * ncols;
+
+            float sum = 0.0f;
+            for (int i = lane; i < ncols; i += WARP_SIZE) {
+                sum += xr[i] * xr[i];
+            }
+            sum = warp_reduce_sum(sum, item_ct1);
+
+            const float f = sycl::fmax(sycl::fmin(c / (sycl::sqrt(sum) * scale + bias), hi), lo);
+            for (int i = lane; i < ncols; i += WARP_SIZE) {
+                dd[row * ncols + i] = xr[i] * f;
+            }
+        });
+}
+
 void ggml_sycl_op_rms_norm_scale_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
                                        ggml_tensor * scale_tensor) {
     const ggml_tensor * src0 = dst->src[0];
