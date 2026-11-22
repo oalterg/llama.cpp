@@ -26,6 +26,13 @@ void ggml_sycl_op_rms_norm_scale_fused(ggml_backend_sycl_context& ctx, ggml_tens
 // nodes = SQR, SUM_ROWS, SQRT, SCALE, FILL, DIV, CLAMP, MUL, as ggml_sycl_can_fuse() matched them
 void ggml_sycl_op_row_norm_clip_fused(ggml_backend_sycl_context& ctx, ggml_tensor ** nodes);
 
+// the register arrays of the fused depth mix
+#define GGML_SYCL_DEPTH_MIX_MAX_STATES  5
+#define GGML_SYCL_DEPTH_MIX_MAX_QUERIES 4
+
+// nodes = RMS_NORM, TRANSPOSE, CONT, REPEAT, MUL_MAT, SOFT_MAX, MUL_MAT, as ggml_sycl_can_fuse() matched them
+void ggml_sycl_op_depth_mix_fused(ggml_backend_sycl_context& ctx, ggml_tensor ** nodes);
+
 void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context& ctx, ggml_tensor* dst, ggml_tensor* mul_tensor, ggml_tensor* add_tensor);
 
 bool ggml_sycl_op_add_rms_norm_fused(ggml_backend_sycl_context & ctx,

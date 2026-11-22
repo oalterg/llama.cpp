@@ -4166,6 +4166,42 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+// Inkling mix(): attention over S stacked states with nq learned queries (a subgraph the SYCL backend fuses)
+struct test_depth_mix : public test_case {
+    const int64_t n_embd, n_states, n_queries, n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DEPTH_MIX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_states, n_queries, n_tokens);
+    }
+
+    test_depth_mix(int64_t n_embd, int64_t n_states, int64_t n_queries, int64_t n_tokens)
+        : n_embd(n_embd), n_states(n_states), n_queries(n_queries), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * states = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_states, n_tokens);
+        ggml_set_param(states);
+        ggml_set_name(states, "states");
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_queries);
+        ggml_set_name(query, "query");
+
+        states = ggml_rms_norm(ctx, states, 1e-6f);
+        ggml_tensor * queries = ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_queries, n_tokens));
+        ggml_tensor * scores = ggml_mul_mat(ctx, states, queries);
+        scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+        ggml_tensor * out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // Inkling clip(): rows scaled down to an L2 norm of at most c (a chain the SYCL backend fuses)
 struct test_row_norm_clip : public test_case {
     const std::array<int64_t, 4> ne;
@@ -11889,6 +11925,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 1, 65536}, false, 1e-6f, false));
     test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-12f, false, false));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-6f, false, false));
+
+    // Inkling's depth mixes: up to 5 states, 1 (ffn, output), 3 (attention) or 4 (loop messages) queries
+    for (int64_t n_states : {1, 3, 5}) {
+        for (int64_t n_queries : {1, 3, 4}) {
+            test_cases.emplace_back(new test_depth_mix(2304, n_states, n_queries, 7));
+        }
+    }
+    // a row length off the work-group size at one token, and 6 states, which the SYCL fusion declines
+    test_cases.emplace_back(new test_depth_mix(300, 5, 4, 1));
+    test_cases.emplace_back(new test_depth_mix(300, 6, 4, 1));
 
     // the row lengths of Inkling's q/k (128) and relative-position (16) clips; c straddles the norms
     for (int64_t n : {128, 16}) {

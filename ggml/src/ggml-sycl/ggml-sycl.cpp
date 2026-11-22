@@ -6877,6 +6877,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             i++;
             continue;
         }
+        if (node->op == GGML_OP_RMS_NORM &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_REPEAT,
+                                            GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT }, {})) {
+            ggml_sycl_op_depth_mix_fused(*sycl_ctx, cgraph->nodes + i);
+            i += 6;
+            continue;
+        }
         if (node->op == GGML_OP_SQR &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL,
                                             GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL }, {})) {

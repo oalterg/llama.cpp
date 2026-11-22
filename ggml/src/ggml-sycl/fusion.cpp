@@ -1,5 +1,6 @@
 #include "fusion.hpp"
 #include "binbcast.hpp"
+#include "norm.hpp"
 
 #include <algorithm>
 
@@ -165,6 +166,34 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
 
         return x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_is_contiguous(n[7]) &&
                ggml_are_same_shape(x, n[7]);
+    }
+
+    // Inkling's depth attention mix(): rms-normed states [n_embd, S, T] scored against learned queries
+    // [n_embd, nq], a softmax over S, and the weighted sum of the normed states; the last MUL_MAT is the output
+    if (ops.size() == 7 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_TRANSPOSE) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 6 })) {
+            return false;
+        }
+
+        ggml_tensor * const * n   = cgraph->nodes + node_idx;
+        const ggml_tensor *   x   = n[0]->src[0];
+        const ggml_tensor *   rep = n[3];
+        const ggml_tensor *   q   = rep->src[0];
+        const ggml_tensor *   sm  = n[5];
+        const ggml_tensor *   out = n[6];
+        if (n[1]->src[0] != n[0] || n[2]->src[0] != n[1] || n[4]->src[0] != n[0] || n[4]->src[1] != rep ||
+            sm->src[0] != n[4] || sm->src[1] || sm->src[2] || out->src[0] != n[2] || out->src[1] != sm) {
+            return false;
+        }
+        if (ggml_get_op_params_f32(sm, 1) != 0.0f) {
+            return false;  // max_bias
+        }
+
+        return x->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 && out->type == GGML_TYPE_F32 &&
+               ggml_is_contiguous(x) && ggml_is_contiguous(q) && ggml_is_contiguous(out) &&
+               x->ne[3] == 1 && q->ne[0] == x->ne[0] && q->ne[2] == 1 && q->ne[3] == 1 &&
+               rep->ne[2] == x->ne[2] && rep->ne[3] == 1 &&
+               x->ne[1] <= GGML_SYCL_DEPTH_MIX_MAX_STATES && q->ne[1] <= GGML_SYCL_DEPTH_MIX_MAX_QUERIES;
     }
 
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {

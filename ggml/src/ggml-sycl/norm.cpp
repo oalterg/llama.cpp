@@ -815,6 +815,125 @@ void ggml_sycl_op_row_norm_clip_fused(ggml_backend_sycl_context & ctx, ggml_tens
         });
 }
 
+// Inkling's mix() per token: a softmax over the S rms-normed states of their dot with each learned query,
+// then the weighted sum of the normed states. The states are read twice and nothing in between is stored.
+void ggml_sycl_op_depth_mix_fused(ggml_backend_sycl_context & ctx, ggml_tensor ** nodes) {
+    constexpr int NS = GGML_SYCL_DEPTH_MIX_MAX_STATES;
+    constexpr int NQ = GGML_SYCL_DEPTH_MIX_MAX_QUERIES;
+    constexpr int NV = NS * (NQ + 1);  // per state: the sum of squares, then one dot per query
+    constexpr int WG = 256;
+
+    const ggml_tensor * x   = nodes[0]->src[0];  // [n_embd, S, T]
+    const ggml_tensor * q   = nodes[3]->src[0];  // [n_embd, nq]
+    ggml_tensor *       dst = nodes[6];          // [n_embd, nq, T]
+
+    const float eps   = ggml_get_op_params_f32(nodes[0], 0);
+    const float scale = ggml_get_op_params_f32(nodes[5], 0);
+
+    const int     n_embd = x->ne[0];
+    const int     S      = x->ne[1];
+    const int     nq     = q->ne[1];
+    const int64_t T      = x->ne[2];
+    const float * xd     = static_cast<const float *>(x->data);
+    const float * qd     = static_cast<const float *>(q->data);
+    float *       dd     = static_cast<float *>(dst->data);
+
+    dpct::queue_ptr stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> part(sycl::range<1>((WG / WARP_SIZE) * NV), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(T * WG), sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                const auto    sg  = it.get_sub_group();
+                const int     tid = it.get_local_id(0);
+                const float * xt  = xd + it.get_group(0) * S * n_embd;
+                float *       dt  = dd + it.get_group(0) * nq * n_embd;
+
+                float acc[NV] = {};
+                for (int e = tid; e < n_embd; e += WG) {
+                    float qe[NQ];
+#pragma unroll
+                    for (int j = 0; j < NQ; ++j) {
+                        qe[j] = j < nq ? qd[j * n_embd + e] : 0.0f;
+                    }
+#pragma unroll
+                    for (int s = 0; s < NS; ++s) {
+                        if (s < S) {
+                            const float v = xt[s * n_embd + e];
+                            acc[s * (NQ + 1)] += v * v;
+#pragma unroll
+                            for (int j = 0; j < NQ; ++j) {
+                                acc[s * (NQ + 1) + 1 + j] += v * qe[j];
+                            }
+                        }
+                    }
+                }
+
+#pragma unroll
+                for (int k = 0; k < NV; ++k) {
+                    const float r = sycl::reduce_over_group(sg, acc[k], sycl::plus<float>());
+                    if (sg.get_local_linear_id() == 0) {
+                        part[sg.get_group_linear_id() * NV + k] = r;
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+
+#pragma unroll
+                for (int k = 0; k < NV; ++k) {
+                    float r = 0.0f;
+                    for (int g = 0; g < WG / WARP_SIZE; ++g) {
+                        r += part[g * NV + k];
+                    }
+                    acc[k] = r;
+                }
+
+                // the softmax weights, with each state's 1/rms folded in
+                float w[NS * NQ];
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) {
+                    float m = -INFINITY;
+#pragma unroll
+                    for (int s = 0; s < NS; ++s) {
+                        const float inv = sycl::rsqrt(acc[s * (NQ + 1)] / n_embd + eps);
+                        w[s * NQ + j] = s < S ? acc[s * (NQ + 1) + 1 + j] * inv * scale : -INFINITY;
+                        m = sycl::fmax(m, w[s * NQ + j]);
+                    }
+                    float sum = 0.0f;
+#pragma unroll
+                    for (int s = 0; s < NS; ++s) {
+                        w[s * NQ + j] = s < S ? sycl::exp(w[s * NQ + j] - m) : 0.0f;
+                        sum += w[s * NQ + j];
+                    }
+#pragma unroll
+                    for (int s = 0; s < NS; ++s) {
+                        w[s * NQ + j] *= sycl::rsqrt(acc[s * (NQ + 1)] / n_embd + eps) / sum;
+                    }
+                }
+
+                for (int e = tid; e < n_embd; e += WG) {
+                    float o[NQ] = {};
+#pragma unroll
+                    for (int s = 0; s < NS; ++s) {
+                        if (s < S) {
+                            const float v = xt[s * n_embd + e];
+#pragma unroll
+                            for (int j = 0; j < NQ; ++j) {
+                                o[j] += w[s * NQ + j] * v;
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < NQ; ++j) {
+                        if (j < nq) {
+                            dt[j * n_embd + e] = o[j];
+                        }
+                    }
+                }
+            });
+    });
+}
+
 void ggml_sycl_op_rms_norm_scale_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
                                        ggml_tensor * scale_tensor) {
     const ggml_tensor * src0 = dst->src[0];
