@@ -132,7 +132,8 @@ static void mkl_fa_online_softmax_chunk(
     const sycl::half * mask_data, int64_t mask_head_stride,
     int64_t mask_row_stride, int mask_n_heads,
     float logit_softcap, int64_t wg_size,
-    const sycl::event & dep_event) {
+    const sycl::event & dep_event,
+    const fattn_indexed_bias bias = {}, int64_t query0 = 0, int n_heads = 0) {
 
     // One work-group per query row: exactly q_rows groups of wg_size
     // items. q_rows * wg_size is already a multiple of wg_size, so unlike
@@ -171,8 +172,19 @@ static void mkl_fa_online_softmax_chunk(
                         s = logit_softcap * sycl::tanh(s);
                     }
                     if (mask_h) {
-                        s += (float)mask_h[q_row * m_stride
-                            + (chunk_start + i)];
+                        const int k = chunk_start + i;
+                        float     m = (float)mask_h[q_row * m_stride + k];
+                        if (bias.table) {
+                            // as the tile kernel: queries of all sequences flattened in sequence order,
+                            // and the F16 rounding of the dense mask the bias replaces
+                            const int64_t query = query0 + q_row;
+                            const int     bin   = bias.indices[query * bias.stride + k];
+                            if ((uint32_t) bin < bias.n_bins) {
+                                m = (float) sycl::half(m + bias.table[(query * bias.n_bins + bin) * n_heads +
+                                                                      kvh_head + gqa_group]);
+                            }
+                        }
+                        s += m;
                     }
                     return s;
                 };
@@ -217,7 +229,8 @@ static void mkl_fa_normalize_head(
     const float * __restrict VKQ_accum,
     const float * __restrict KQ_sum,
     int iqh, int n_queries, int DV, int n_q_heads,
-    int64_t src_offset, int64_t wg_size) {
+    int64_t src_offset, int64_t wg_size,
+    const float * KQ_max = nullptr, const float * sinks = nullptr) {
 
     const int64_t wg = ((n_queries + wg_size - 1) / wg_size) * wg_size;
 
@@ -229,6 +242,13 @@ static void mkl_fa_normalize_head(
 
                 int     ksum_idx = (int)(src_offset / DV) + jc;
                 float   inv_sum  = 1.0f / KQ_sum[ksum_idx];
+                if (sinks) {
+                    // the sink joins the softmax denominator, as in the tile kernel's final scale
+                    const float sink  = sinks[iqh];
+                    const float m     = sycl::fmax(KQ_max[ksum_idx], sink);
+                    const float scale = sycl::native::exp(KQ_max[ksum_idx] - m);
+                    inv_sum = scale / (KQ_sum[ksum_idx] * scale + sycl::native::exp(sink - m));
+                }
                 const float * __restrict src = VKQ_accum
                     + src_offset + jc * (int64_t)DV;
                 // Interleaved dst layout (matching TILE):
@@ -361,10 +381,20 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const float *       sinks = dst->src[4] ? (const float *) dst->src[4]->data : nullptr;
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
+
+    fattn_indexed_bias bias = {};
+    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
+        const ggml_tensor * table   = dst->src[6];
+        const ggml_tensor * indices = dst->src[7];
+        GGML_ASSERT(table && indices && mask && mask->ne[2] == 1);
+        bias = { (const float *) table->data, (const int32_t *) indices->data, table->ne[1],
+                 (int64_t) (indices->nb[1] / sizeof(int32_t)) };
+    }
 
     // --- Op params ---
     float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
@@ -603,7 +633,8 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             kvh_base_head,
                             mask_batch, mask_head_stride,
                             mask_row_stride, mask_n_heads,
-                            logit_softcap, wg_size, kq_done);
+                            logit_softcap, wg_size, kq_done,
+                            bias, (int64_t) ib * n_queries, n_q_heads);
                         MKL_ACCUM(softmax_time_us, t0);
                     }
 
@@ -648,7 +679,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 mkl_fa_normalize_head(stream,
                     dst_batch, VKQ_accum_ptr, KQ_sum_ptr,
                     iqh, n_queries, DV, n_q_heads,
-                    src_offset, wg_size);
+                    src_offset, wg_size, KQ_max_ptr, sinks);
             }
         }
     }

@@ -160,7 +160,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         V->ne[0] == 512 && gqa_ratio == 20 &&
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
 
-    if (!indexed_bias && g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
+    // It also takes an indexed bias (with or without sinks): the tile kernel's bias path cannot use its
+    // GQA layout, and the MKL softmax applies the bias as the tile kernel does. Sinks alone keep their path.
+    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && (!sinks || indexed_bias) && (!indexed_bias || mask->ne[2] == 1) &&
+        gqa_ratio >= 2 &&
         (standard_shape || glm_mla_shape) &&
         Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
